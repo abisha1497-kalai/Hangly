@@ -23,13 +23,18 @@ class PendulumView(
     private val pivotX: Float,
     private val chainLen: Float,
     private val density: Float,
-    style: Int
+    style: Int,
+    /** How far the rope may stretch while dragging, as a multiple of its rest length. */
+    private val maxStretch: Float = 2f
 ) : View(context) {
 
     companion object {
         private const val N = 14          // points in the chain
         private const val ITERATIONS = 22 // constraint passes per step
         private const val DAMPING = 0.996f // velocity kept per 1/120 s step
+        private const val SPRING_K = 260f  // elastic pull-back strength (higher = snappier)
+        private const val SPRING_C = 9f    // elastic damping (lower = more bounce)
+        private const val MIN_STRETCH = 0.9f // slight squash on the rebound
     }
 
     private val x = FloatArray(N)
@@ -51,6 +56,10 @@ class PendulumView(
     private var grabDy = 0f
 
     private var angle = 0f
+
+    /** Current rope length as a multiple of its rest length (1 = relaxed). */
+    private var stretch = 1f
+    private var stretchVel = 0f
     private val path = Path()
 
     private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -102,6 +111,21 @@ class PendulumView(
     /** Advances the simulation by [dt] seconds (call with a small fixed step, e.g. 1/120). */
     fun step(dt: Float) {
         val dt2 = dt * dt
+        // Elastic rope: follows the finger while dragging, springs back (with a bounce) on release.
+        if (dragging) {
+            val d = hypot(x[N - 1] - pivotX, y[N - 1])
+            val target = (d / chainLen).coerceIn(1f, maxStretch)
+            stretchVel = (target - stretch) / dt * 0.2f
+            stretch += (target - stretch) * 0.5f
+        } else if (stretch != 1f || stretchVel != 0f) {
+            stretchVel += (-SPRING_K * (stretch - 1f) - SPRING_C * stretchVel) * dt
+            stretch = (stretch + stretchVel * dt).coerceIn(MIN_STRETCH, maxStretch)
+            if (abs(stretch - 1f) < 0.0005f && abs(stretchVel) < 0.01f) {
+                stretch = 1f
+                stretchVel = 0f
+            }
+        }
+        val rest = seg * stretch
         for (i in 1 until N) {
             if (dragging && i == N - 1) continue
             val vx = (x[i] - ox[i]) * DAMPING
@@ -130,7 +154,7 @@ class PendulumView(
                 val wj = if (dragging && j == N - 1) 0f else invMass[j]
                 val ws = wi + wj
                 if (ws == 0f) continue
-                val diff = (dist - seg) / dist
+                val diff = (dist - rest) / dist
                 x[i] += dx * diff * wi / ws
                 y[i] += dy * diff * wi / ws
                 x[j] -= dx * diff * wj / ws
@@ -145,6 +169,7 @@ class PendulumView(
     fun motion(): Float {
         var s = 0f
         for (i in 1 until N) s += abs(x[i] - ox[i]) + abs(y[i] - oy[i])
+        s += abs(stretch - 1f) * 50f + abs(stretchVel)
         return s
     }
 
@@ -171,7 +196,7 @@ class PendulumView(
         var ty = (rawY + grabDy).coerceAtLeast(0f)
         val dx = tx - pivotX
         val dist = hypot(dx, ty)
-        val maxReach = chainLen * 0.995f
+        val maxReach = chainLen * maxStretch * 0.995f
         if (dist > maxReach) {
             val k = maxReach / dist
             tx = pivotX + dx * k
