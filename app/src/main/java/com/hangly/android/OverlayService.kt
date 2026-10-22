@@ -249,8 +249,9 @@ class OverlayService : Service(), SensorEventListener {
         val chain = min(prefs.chainDp * d, screen.y * 0.6f)
         val pivotX = screen.x * (0.06f + 0.88f * prefs.pivot / 100f)
 
-        val p = PendulumView(this, bob, pivotX, chain, d, prefs.style)
-        val height = (chain + bob.height + 28 * d).toInt()
+        val maxStretch = min(2f, (screen.y - bob.height - 28 * d) / chain).coerceAtLeast(1f)
+        val p = PendulumView(this, bob, pivotX, chain, d, prefs.style, maxStretch)
+        val height = (chain * maxStretch + bob.height + 28 * d).toInt()
 
         val renderFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
