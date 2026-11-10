@@ -28,24 +28,21 @@ import android.provider.Settings
 import android.view.Choreographer
 import android.view.Display
 import android.view.Gravity
-import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.WindowManager
 import kotlin.math.abs
-import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
 /**
  * Foreground service that draws the hanging pendant over every app.
  *
- * These overlay windows are used:
- *  - a full-width, touch-through window that draws the chains and pendants, and
- *  - one small invisible window per charm that follows its pendant and catches touches, so you
- *    can grab, tap or long-press it while everything else on screen stays tappable.
+ * Two overlay windows are used:
+ *  - a full-width, touch-through window that draws the chain and pendant, and
+ *  - a small invisible window that follows the pendant and catches touches, so you can
+ *    grab and swing it while everything else on screen stays tappable.
  */
 class OverlayService : Service(), SensorEventListener {
 
@@ -54,8 +51,6 @@ class OverlayService : Service(), SensorEventListener {
         private const val CHANNEL = "hangly_overlay"
         private const val NOTIF_ID = 7
         private const val STEP = 1f / 120f
-        /** Settings that change behaviour but not the look: no need to rebuild the overlay. */
-        private val NO_REBUILD = setOf("enabled", "tapAction", "longAction", "haptics")
 
         fun start(ctx: Context) {
             val i = Intent(ctx, OverlayService::class.java)
@@ -78,10 +73,10 @@ class OverlayService : Service(), SensorEventListener {
     }
 
     private var pendulum: PendulumView? = null
-    private val handles = ArrayList<HandleView>()
-    private val handleParams = ArrayList<WindowManager.LayoutParams>()
-    private var charmPx = 0
-    private var muteRebuild = false
+    private var handleView: View? = null
+    private var handleParams: WindowManager.LayoutParams? = null
+    private var handleW = 0
+    private var handleH = 0
     private val center = FloatArray(2)
 
     // Animation loop state
@@ -98,7 +93,7 @@ class OverlayService : Service(), SensorEventListener {
     private var wokeDown = 9.81f
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (!muteRebuild && (key ?: "") !in NO_REBUILD) {
+        if (key != "enabled") {
             handler.removeCallbacks(rebuild)
             handler.postDelayed(rebuild, 150)
         }
@@ -130,9 +125,9 @@ class OverlayService : Service(), SensorEventListener {
             }
             if (n == 8) acc = 0f
             p.invalidate()
-            updateHandles(p)
+            updateHandle(p)
 
-            if (!p.anyDragging && p.motion() < 0.05f * resources.displayMetrics.density) restFrames++ else restFrames = 0
+            if (!p.dragging && p.motion() < 0.05f * resources.displayMetrics.density) restFrames++ else restFrames = 0
             if (restFrames > 90) {
                 frameScheduled = false // settled: stop drawing until something disturbs it
             } else {
@@ -250,38 +245,13 @@ class OverlayService : Service(), SensorEventListener {
         val d = resources.displayMetrics.density
         val screen = screenSize()
 
-        // Several charms must fit side by side, so each one gets narrower.
-        val count = prefs.charmCount
-        val maxEachDp = (screen.x / d * 0.9f / count).toInt()
-        val sizeDp = if (count > 1) min(prefs.sizeDp, maxEachDp) else prefs.sizeDp
-        charmPx = (sizeDp * d).toInt()
+        val bob = PendantStore.load(this, (prefs.sizeDp * d).toInt())
         val chain = min(prefs.chainDp * d, screen.y * 0.6f)
-        val worstBobH = charmPx * 1.8f // tallest a picture can get, so swapping charms never clips
+        val pivotX = screen.x * (0.06f + 0.88f * prefs.pivot / 100f)
 
-        // Hooks are spaced just wider than a charm, so charms touch only when they swing together.
-        val spacing = charmPx * 1.05f
-        var groupX = screen.x * (0.06f + 0.88f * prefs.pivot / 100f)
-        if (count > 1) {
-            val half = spacing * (count - 1) / 2f + charmPx / 2f
-            groupX = if (half * 2f < screen.x) groupX.coerceIn(half, screen.x - half) else screen.x / 2f
-        }
-        val offsets = when (count) {
-            1 -> floatArrayOf(0f)
-            2 -> floatArrayOf(-0.5f, 0.5f)
-            else -> floatArrayOf(-1f, 0f, 1f)
-        }
-        val lengthFactor = floatArrayOf(1f, 0.82f, 0.92f) // different lengths so they overlap less at rest
-
-        val specs = ArrayList<StrandSpec>()
-        var windowH = 0f
-        for (i in 0 until count) {
-            val len = chain * lengthFactor[i]
-            val maxStretch = min(2f, (screen.y - worstBobH - 28 * d) / len).coerceAtLeast(1f)
-            specs.add(StrandSpec(PendantStore.load(this, i, charmPx), groupX + offsets[i] * spacing, len, maxStretch))
-            windowH = max(windowH, len * maxStretch + worstBobH + 28 * d)
-        }
-        val p = PendulumView(this, specs, d, prefs.style)
-        val height = min(windowH, screen.y.toFloat()).toInt()
+        val maxStretch = min(2f, (screen.y - bob.height - 28 * d) / chain).coerceAtLeast(1f)
+        val p = PendulumView(this, bob, pivotX, chain, d, prefs.style, maxStretch)
+        val height = (chain * maxStretch + bob.height + 28 * d).toInt()
 
         val renderFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -303,55 +273,47 @@ class OverlayService : Service(), SensorEventListener {
             }
         }
 
+        handleW = max(bob.width, (56 * d).toInt())
+        handleH = max(bob.height, (56 * d).toInt())
+        val hv = HandleView()
         val handleFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-        for (i in 0 until count) {
-            val hv = HandleView(i)
-            hv.hw = max(specs[i].bob.width, (56 * d).toInt())
-            hv.hh = max(specs[i].bob.height, (56 * d).toInt())
-            val hp = WindowManager.LayoutParams(
-                hv.hw, hv.hh,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                handleFlags, PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                if (Build.VERSION.SDK_INT >= 28) {
-                    layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                }
+        val hp = WindowManager.LayoutParams(
+            handleW, handleH,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            handleFlags, PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= 28) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
             }
-            handles.add(hv)
-            handleParams.add(hp)
         }
 
         try {
             wm.addView(p, rp)
-            for (i in handles.indices) wm.addView(handles[i], handleParams[i])
+            wm.addView(hv, hp)
         } catch (e: Exception) {
             // Permission revoked or window refused: shut down cleanly.
             try { wm.removeView(p) } catch (e: Exception) {}
-            for (h in handles) try { wm.removeView(h) } catch (e: Exception) {}
-            handles.clear()
-            handleParams.clear()
             prefs.enabled = false
             stopSelf()
             return
         }
         pendulum = p
+        handleView = hv
+        handleParams = hp
 
         sensorManager.unregisterListener(this)
         if (prefs.tilt && !paused) {
             accel?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         }
         pushGravity()
-        for (i in handles.indices) {
-            val hp = handleParams[i]
-            p.bobCenter(i, center)
-            hp.x = (center[0] - handles[i].hw / 2f).toInt()
-            hp.y = (center[1] - handles[i].hh / 2f).toInt()
-            try { wm.updateViewLayout(handles[i], hp) } catch (e: Exception) {}
-        }
+        p.bobCenter(center)
+        hp.x = (center[0] - handleW / 2f).toInt()
+        hp.y = (center[1] - handleH / 2f).toInt()
+        try { wm.updateViewLayout(hv, hp) } catch (e: Exception) {}
         wake()
     }
 
@@ -359,24 +321,22 @@ class OverlayService : Service(), SensorEventListener {
         choreographer.removeFrameCallback(frame)
         frameScheduled = false
         pendulum?.let { try { wm.removeView(it) } catch (e: Exception) {} }
-        for (h in handles) try { wm.removeView(h) } catch (e: Exception) {}
-        handles.clear()
-        handleParams.clear()
+        handleView?.let { try { wm.removeView(it) } catch (e: Exception) {} }
         pendulum = null
+        handleView = null
+        handleParams = null
     }
 
-    private fun updateHandles(p: PendulumView) {
-        for (i in handles.indices) {
-            val hv = handles[i]
-            val hp = handleParams[i]
-            p.bobCenter(i, center)
-            val nx = (center[0] - hv.hw / 2f).toInt()
-            val ny = (center[1] - hv.hh / 2f).toInt()
-            if (nx != hp.x || ny != hp.y) {
-                hp.x = nx
-                hp.y = ny
-                try { wm.updateViewLayout(hv, hp) } catch (e: Exception) {}
-            }
+    private fun updateHandle(p: PendulumView) {
+        val hv = handleView ?: return
+        val hp = handleParams ?: return
+        p.bobCenter(center)
+        val nx = (center[0] - handleW / 2f).toInt()
+        val ny = (center[1] - handleH / 2f).toInt()
+        if (nx != hp.x || ny != hp.y) {
+            hp.x = nx
+            hp.y = ny
+            try { wm.updateViewLayout(hv, hp) } catch (e: Exception) {}
         }
     }
 
@@ -450,127 +410,22 @@ class OverlayService : Service(), SensorEventListener {
         p.gy = down * unit
     }
 
-    // ---------- touch and actions ----------
+    // ---------- touch ----------
 
-    private fun haptic(v: View, strong: Boolean) {
-        if (!prefs.haptics) return
-        v.performHapticFeedback(
-            if (strong) HapticFeedbackConstants.LONG_PRESS else HapticFeedbackConstants.VIRTUAL_KEY
-        )
-    }
-
-    /** A quick tap on charm [i]. [rawX] is where the finger landed, to push it away from that side. */
-    private fun onTap(i: Int, rawX: Float) {
-        val p = pendulum ?: return
-        when (prefs.tapAction) {
-            0 -> {
-                p.bobCenter(i, center)
-                val dir = if (rawX < center[0]) 1f else -1f
-                p.nudge(i, dir * 2.4f * resources.displayMetrics.density)
-                p.sparkle(i)
-                handles.getOrNull(i)?.let { haptic(it, false) }
-            }
-            1 -> {
-                cycleCharm(i)
-                handles.getOrNull(i)?.let { haptic(it, false) }
-            }
-        }
-        wake()
-    }
-
-    /** Holding charm [i] without moving. */
-    private fun onLongPress(i: Int) {
-        when (prefs.longAction) {
-            0 -> try {
-                startActivity(
-                    Intent(this, MainActivity::class.java)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                )
-            } catch (e: Exception) {
-                // Some phones refuse to start an app from the background; nothing to do.
-            }
-            1 -> cycleCharm(i)
-            2 -> handler.post {
-                prefs.enabled = false
-                stopSelf()
-            }
-        }
-        wake()
-    }
-
-    /** Swaps charm [i] for the next built-in pendant, keeping it swinging where it is. */
-    private fun cycleCharm(i: Int) {
-        val p = pendulum ?: return
-        if (i !in handles.indices) return
-        val ids = DefaultPendant.IDS
-        val next = ids[(ids.indexOf(PendantStore.idFor(this, i)) + 1) % ids.size]
-        muteRebuild = true
-        try {
-            prefs.setPendantId(i, next)
-        } finally {
-            muteRebuild = false
-        }
-        val bob = PendantStore.load(this, i, charmPx)
-        p.setBob(i, bob)
-        val d = resources.displayMetrics.density
-        val hv = handles[i]
-        val hp = handleParams[i]
-        hv.hw = max(bob.width, (56 * d).toInt())
-        hv.hh = max(bob.height, (56 * d).toInt())
-        hp.width = hv.hw
-        hp.height = hv.hh
-        try { wm.updateViewLayout(hv, hp) } catch (e: Exception) {}
-        p.sparkle(i)
-    }
-
-    /** The invisible window that follows charm [index] and catches touches on it. */
-    private inner class HandleView(val index: Int) : View(this@OverlayService) {
-        var hw = 0
-        var hh = 0
-        private var downX = 0f
-        private var downY = 0f
-        private var moved = false
-        private var heldLong = false
-        private val slop = ViewConfiguration.get(this@OverlayService).scaledTouchSlop.toFloat()
-        private val longPress = Runnable {
-            if (!moved && !heldLong) {
-                heldLong = true
-                haptic(this, true)
-                onLongPress(index)
-            }
-        }
-
-        override fun onDetachedFromWindow() {
-            removeCallbacks(longPress)
-            super.onDetachedFromWindow()
-        }
-
+    private inner class HandleView : View(this@OverlayService) {
         override fun onTouchEvent(e: MotionEvent): Boolean {
             val p = pendulum ?: return false
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    downX = e.rawX
-                    downY = e.rawY
-                    moved = false
-                    heldLong = false
-                    p.beginDrag(index, e.rawX, e.rawY)
-                    postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                    p.beginDrag(e.rawX, e.rawY)
                     wake()
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (!moved && hypot(e.rawX - downX, e.rawY - downY) > slop) {
-                        moved = true
-                        removeCallbacks(longPress)
-                    }
-                    p.dragTo(index, e.rawX, e.rawY)
+                    p.dragTo(e.rawX, e.rawY)
                     wake()
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    removeCallbacks(longPress)
-                    p.endDrag(index)
-                    if (e.actionMasked == MotionEvent.ACTION_UP && !moved && !heldLong) {
-                        onTap(index, e.rawX)
-                    }
+                    p.endDrag()
                     wake()
                 }
             }
